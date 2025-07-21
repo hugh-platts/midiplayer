@@ -27,15 +27,15 @@
 </head>
 <body>
     <div id="start-overlay">
-        Click to Initialize
-        <p>Upload a .MID file to begin</p>
+        Click to Start
+        <p>"Merry-Go-Round of Life" will play by default if available.</p>
     </div>
     <div id="top-bar">
         <input type="range" id="songPositionSlider" min="0" max="100" value="0" step="0.01">
     </div>
     <div id="ui-container">
         <div class="control-group">
-            <label id="uploadLabel" for="midiFileInput">Upload MIDI File</label>
+            <label id="uploadLabel" for="midiFileInput">Upload Different MIDI</label>
             <input type="file" id="midiFileInput" accept=".mid,.midi">
         </div>
         <div class="control-group">
@@ -61,15 +61,11 @@
 
     // --- State ---
     let audioContext, masterGain;
-    let visualNotes = []; // Notes for drawing
-    let audioNotes = [];  // Notes for playing sound
+    let visualNotes = [];
+    let audioNotes = [];
     let isPlaying = false;
     let startTime = 0;
-    let songStartTicker = 0;
     let animationFrameId;
-
-    // --- Visual Config ---
-    const NOTE_FALL_DURATION = 2.0; // Time in seconds for a note to fall from top to key
 
     // --- Audio Functions ---
     function setupAudio() {
@@ -93,30 +89,71 @@
         noteGain.connect(masterGain);
         osc.type = 'triangle';
         osc.frequency.value = midiToFreq(midi);
-        noteGain.gain.setValueAtTime(masterGain.gain.value, time);
-        noteGain.gain.exponentialRampToValueAtTime(0.0001, time + 0.8);
-        osc.start(time);
-        osc.stop(time + 0.8);
+        const now = audioContext.currentTime;
+        const playTime = now + (time - (now - startTime));
+        noteGain.gain.setValueAtTime(masterGain.gain.value, playTime);
+        noteGain.gain.exponentialRampToValueAtTime(0.0001, playTime + 0.8);
+        osc.start(playTime);
+        osc.stop(playTime + 0.8);
     }
 
-    // --- MIDI Processing ---
+    // --- MIDI Processing & Loading ---
+    function stopCurrentSong() {
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        isPlaying = false;
+        // This is a simple way to stop sound; a more robust solution would track and stop oscillators.
+        if (audioContext) {
+             masterGain.gain.setValueAtTime(masterGain.gain.value, audioContext.currentTime);
+             masterGain.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.1);
+             // Re-establish volume for next song
+             setTimeout(() => masterGain.gain.linearRampToValueAtTime(volumeSlider.value, audioContext.currentTime + 0.1), 200);
+        }
+    }
+
     midiFileInput.addEventListener('change', (event) => {
         const file = event.target.files[0];
         if (!file) return;
         const reader = new FileReader();
         reader.onload = (e) => {
-            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            stopCurrentSong();
             const parsedMidi = MidiParser.parse(e.target.result);
             processMidiData(parsedMidi);
             startPlayback();
         };
-        reader.readAsArrayBuffer(file);
+        reader.readAsDataURL(file);
     });
 
+    async function loadDefaultSong() {
+        try {
+            const defaultSongName = "Joe Hisaishi - Merry Go Round Of Life (Howl's Moving Castle).mid";
+            const response = await fetch(defaultSongName);
+            if (!response.ok) {
+                console.log("Default MIDI file not found. Waiting for user upload.");
+                return;
+            }
+            const arrayBuffer = await response.arrayBuffer();
+            // The parser expects a Data URL, so we construct one.
+            let binary = '';
+            const bytes = new Uint8Array(arrayBuffer);
+            bytes.forEach((byte) => binary += String.fromCharCode(byte));
+            const base64 = window.btoa(binary);
+            const dataUrl = `data:audio/midi;base64,${base64}`;
+
+            const parsedMidi = MidiParser.parse(dataUrl);
+            processMidiData(parsedMidi);
+            startPlayback();
+        } catch (error) {
+            console.error("Error loading default song:", error);
+        }
+    }
+    
     function processMidiData(parsedMidi) {
         visualNotes = [];
         let ticksPerQuarterNote = parsedMidi.timeDivision;
-        let microsecondsPerQuarterNote = 500000; // Default 120 bpm
+        let microsecondsPerQuarterNote = 500000;
         let absoluteTick = 0;
 
         parsedMidi.track.forEach(track => {
@@ -126,18 +163,17 @@
                 absoluteTick += event.deltaTime;
                 const absoluteTimeSeconds = (absoluteTick / ticksPerQuarterNote) * (microsecondsPerQuarterNote / 1000000);
 
-                if (event.metaType === 81) { // Set Tempo
+                if (event.metaType === 81) {
                     microsecondsPerQuarterNote = event.data;
-                } else if (event.type === 9) { // Note On
-                    noteOnEvents[event.data[0]] = { time: absoluteTimeSeconds, velocity: event.data[1] };
-                } else if (event.type === 8 || (event.type === 9 && event.data[1] === 0)) { // Note Off
+                } else if (event.type === 9 && event.data[1] > 0) {
+                    noteOnEvents[event.data[0]] = { time: absoluteTimeSeconds };
+                } else if (event.type === 8 || (event.type === 9 && event.data[1] === 0)) {
                     const onEvent = noteOnEvents[event.data[0]];
                     if (onEvent) {
                         visualNotes.push({
                             midi: event.data[0],
                             time: onEvent.time,
                             duration: absoluteTimeSeconds - onEvent.time,
-                            velocity: onEvent.velocity
                         });
                         delete noteOnEvents[event.data[0]];
                     }
@@ -146,38 +182,39 @@
         });
 
         visualNotes.sort((a, b) => a.time - b.time);
-        audioNotes = JSON.parse(JSON.stringify(visualNotes)); // Deep copy for audio scheduling
+        audioNotes = JSON.parse(JSON.stringify(visualNotes));
         const totalDuration = visualNotes.length > 0 ? visualNotes[visualNotes.length - 1].time : 0;
         songPositionSlider.max = totalDuration;
         songPositionSlider.style.display = 'block';
     }
     
     // --- Playback Control ---
-    function startPlayback() {
+    function startPlayback(seekTime = 0) {
         if (isPlaying) return;
         isPlaying = true;
-        startTime = audioContext.currentTime;
-        songStartTicker = 0;
+        startTime = audioContext.currentTime - seekTime;
 
-        // Schedule all audio notes at once
-        audioNotes.forEach(note => playNoteSound(note.midi, startTime + note.time));
+        audioNotes.forEach(note => {
+            if (note.time >= seekTime) {
+                playNoteSound(note.midi, startTime + note.time);
+            }
+        });
         
         animate();
     }
 
     songPositionSlider.addEventListener('input', (e) => {
-        const seekTime = parseFloat(e.target.value);
-        if (isPlaying) {
-            startTime = audioContext.currentTime - seekTime;
-        } else {
-            songStartTicker = seekTime;
-        }
+        stopCurrentSong();
+        // A short delay to allow sounds to fade before restarting
+        setTimeout(() => {
+            startPlayback(parseFloat(e.target.value));
+        }, 150);
     });
 
-    // --- Keyboard & Note Drawing ---
+    // --- Main Animation Loop & Drawing ---
+    const NOTE_FALL_DURATION = 2.0;
     const keyMap = {};
-    const whiteKeyCount = 52;
-    const whiteKeyWidth = window.innerWidth / whiteKeyCount;
+    const whiteKeyWidth = window.innerWidth / 52;
     const whiteKeyHeight = window.innerHeight * 0.25;
     const blackKeyWidth = whiteKeyWidth * 0.7;
     const blackKeyHeight = whiteKeyHeight * 0.6;
@@ -196,77 +233,68 @@
     const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
     function midiToNoteName(midi) { return noteNames[midi % 12]; }
 
-    // --- Main Animation Loop ---
     function animate() {
         if (!isPlaying) return;
         
         const currentTime = audioContext.currentTime - startTime;
+        if (currentTime > songPositionSlider.max) {
+             stopCurrentSong();
+             return; // End of song
+        }
         songPositionSlider.value = currentTime;
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const keyboardTopY = canvas.height - whiteKeyHeight;
         
-        // 1. Draw Falling Notes
         visualNotes.forEach(note => {
             const timeUntilHit = note.time - currentTime;
-            if (timeUntilHit > 0 && timeUntilHit < NOTE_FALL_DURATION) {
+            if (timeUntilHit > -note.duration && timeUntilHit < NOTE_FALL_DURATION) {
                 const key = keyMap[note.midi];
                 const noteWidth = key.isBlack ? blackKeyWidth * 0.9 : whiteKeyWidth * 0.9;
                 const xPos = key.x + (key.width - noteWidth) / 2;
-                const yPos = keyboardTopY - (timeUntilHit / NOTE_FALL_DURATION) * keyboardTopY;
-                const noteHeight = (note.duration / NOTE_FALL_DURATION) * keyboardTopY;
-
+                
+                const yStart = keyboardTopY - (timeUntilHit / NOTE_FALL_DURATION) * (keyboardTopY);
+                const noteHeight = (note.duration / NOTE_FALL_DURATION) * (keyboardTopY);
+                
                 ctx.fillStyle = key.isBlack ? 'rgba(10, 150, 10, 1)' : 'rgba(50, 255, 50, 1)';
                 ctx.beginPath();
-                ctx.roundRect(xPos, yPos - noteHeight, noteWidth, noteHeight, 8);
+                ctx.roundRect(xPos, yStart - noteHeight, noteWidth, noteHeight, 8);
                 ctx.fill();
 
                 if (showLabelsCheckbox.checked) {
                     ctx.fillStyle = '#FFF';
                     ctx.font = 'bold 14px sans-serif';
                     ctx.textAlign = 'center';
-                    ctx.fillText(midiToNoteName(note.midi), xPos + noteWidth / 2, yPos - 5);
+                    ctx.fillText(midiToNoteName(note.midi), xPos + noteWidth / 2, yStart - 5);
                 }
             }
         });
 
-        // 2. Draw Keyboard and Hit Effects
-        whiteKeyIndex = 0;
         for (let i = 0; i < 88; i++) {
             const midi = 21 + i;
             const key = keyMap[midi];
-            const isBlack = [1, 3, 6, 8, 10].includes(i % 12);
+            const timeSinceHit = currentTime - visualNotes.find(n => n.midi === midi && currentTime >= n.time && currentTime < n.time + n.duration)?.time;
             
-            // Draw hit effect
-            const timeSinceHit = currentTime - audioNotes.find(n => n.midi === midi && currentTime > n.time)?.time;
-            if (timeSinceHit >= 0 && timeSinceHit < 0.5) {
-                const alpha = 1.0 - (timeSinceHit / 0.5);
-                const highlightColor = isBlack ? `rgba(10, 120, 10, ${alpha})` : `rgba(10, 200, 10, ${alpha})`;
-                ctx.fillStyle = highlightColor;
-                ctx.fillRect(key.x, keyboardTopY, key.width, isBlack ? blackKeyHeight : whiteKeyHeight);
+            ctx.fillStyle = key.isBlack ? '#222' : '#FFF';
+            if (timeSinceHit >= 0) {
+                 ctx.fillStyle = key.isBlack ? 'rgba(10, 120, 10, 1)' : 'rgba(10, 200, 10, 1)';
             }
+            ctx.fillRect(key.x, keyboardTopY, key.width, key.isBlack ? blackKeyHeight : whiteKeyHeight);
 
-            // Draw key
-            ctx.fillStyle = isBlack ? '#222' : '#FFF';
-            ctx.fillRect(key.x, keyboardTopY, key.width, isBlack ? blackKeyHeight : whiteKeyHeight);
-            if (!isBlack) {
+            if (!key.isBlack) {
                 ctx.strokeStyle = '#bbb';
                 ctx.strokeRect(key.x, keyboardTopY, key.width, whiteKeyHeight);
-                whiteKeyIndex++;
             }
         }
         
-        if (currentTime > songPositionSlider.max) {
-             isPlaying = false;
-        }
-
         animationFrameId = requestAnimationFrame(animate);
     }
 
     // --- Start Logic ---
-    startOverlay.addEventListener('click', () => {
+    startOverlay.addEventListener('click', async () => {
         setupAudio();
         startOverlay.style.display = 'none';
+        await loadDefaultSong();
     }, { once: true });
 </script>
 </body>
